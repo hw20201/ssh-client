@@ -3170,6 +3170,15 @@ class _FormGlassPanel extends StatelessWidget {
         border: Border.all(color: const Color(0x5595d1e2), width: .9),
       ),
       child: Column(
+        // v23：高度贴合内容——之前这里没写 mainAxisSize，默认是 max；
+        // 在 Dialog 的松约束里（showDialog 用 Center 包着，最大高就是
+        // 屏高），整块面板被撑到约 700dp，内容只占上面约 300dp，底下
+        // 留了一大片空白（主人 17:04 截图）。改成 min 后弹窗高度就是
+        // 标题 + 说明 + 进度条 + 状态 + 按钮这几样加正常间距的高度。
+        // 注意：_FormGlassPanel 只有 _GlassAlert 在用（地理下载弹窗
+        // 和首次连接指纹弹窗），两个弹窗都会跟着变小——指纹弹窗本来
+        // 也该贴合内容，这改动对它也是修好的方向。
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(

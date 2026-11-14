@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
+import 'package:prism_ui/prism_ui.dart' as prism;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:ssh_client/ip_geo_database.dart';
 import 'package:ssh_client/main.dart';
@@ -366,5 +367,62 @@ void main() {
       expect(find.text('首次启动 · 下载位置数据'), findsNothing);
       expect(runner.calls, 0);
     });
+  });
+
+  group('v23: dialog height fits content (small window)', () {
+    testWidgets(
+      'dialog is a small window: height far below screen height, '
+      'cancel sits right under the status text, no empty space below it',
+      (tester) async {
+        final runner = _FakeGeoDownloadRunner();
+        await pumpHome(tester, geoRunner: runner.call);
+        expect(
+          await waitForText(tester, '首次启动 · 下载位置数据'),
+          isTrue,
+        );
+        // Drive progress so the total size is known (same as the v22
+        // halfway state: 13.3MB / 共 26.5MB（50%）).
+        runner.onProgress!(
+          const GeoDownloadProgress(
+            phase: GeoDownloadPhase.downloading,
+            downloadedBytes: 13255088,
+            totalBytes: 26510177,
+          ),
+        );
+        await tester.pump();
+        final screenHeight =
+            tester.view.physicalSize.height / tester.view.devicePixelRatio;
+        // v23：量看得见的面板（Dialog 里唯一的 prism LiquidGlass），
+        // 不要量 Dialog widget 本身——它的根是 Align，会按松约束
+        // 撑满全屏（800×600），面板实际只有约 228dp 高。
+        final panelFinder = find.descendant(
+          of: find.byType(Dialog),
+          matching: find.byType(prism.LiquidGlass),
+        );
+        expect(panelFinder, findsOneWidget);
+        final panelSize = tester.getSize(panelFinder);
+        // v23：弹窗高度贴合内容（标题 + 说明 + 进度条 + 状态 + 按钮，
+        // 约 228dp）。v22 的根因是 _FormGlassPanel 外层 Column 默认
+        // MainAxisSize.max，在 Dialog 的松约束里撑到全屏高（测试面
+        // 600dp 高时面板约 552dp）；这条断言在 v22 代码上会挂。
+        expect(panelSize.height, lessThan(screenHeight * 0.6));
+        // “取消”紧跟在状态文字下面（内容列里 18dp 间距 + 按钮内边距）。
+        final statusBottom = tester
+            .getBottomLeft(
+              find.byKey(const ValueKey('geo_download_progress_text')),
+            )
+            .dy;
+        final cancelTop = tester
+            .getTopLeft(find.byKey(const ValueKey('geo_download_cancel')))
+            .dy;
+        expect(cancelTop - statusBottom, lessThan(60));
+        // “取消”下面没有大片空白（面板底边距 17dp + 边框）。
+        final panelBottom = tester.getBottomLeft(panelFinder).dy;
+        final cancelBottom = tester
+            .getBottomLeft(find.byKey(const ValueKey('geo_download_cancel')))
+            .dy;
+        expect(panelBottom - cancelBottom, lessThan(60));
+      },
+    );
   });
 }
