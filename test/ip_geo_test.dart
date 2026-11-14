@@ -4,7 +4,13 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ssh_client/ip_geo_database.dart';
 
+import 'geo_test_helpers.dart';
+
 /// 城市自动解析的库级证明（普通 test，真实时间）。
+///
+/// v21：地理数据不再打进包里，测试用 `geo_test_helpers.dart` 把一份
+/// 合成的最小 SBGX v1 数据（8.8.8.8 → 美国坐标）种进临时 support 目录
+/// 的 `geo/` 下，再断言同一个 `IpGeoDatabase.lookup`。
 ///
 /// 为什么不用 testWidgets 测真坐标：widget 测试跑在假时间里，真实
 /// 文件读时通时挂，保存那一步可能 1 秒超时走默认落点，且保存后
@@ -15,18 +21,25 @@ import 'package:ssh_client/ip_geo_database.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   late final Directory supportDir;
+  var supportPath = '';
 
   setUpAll(() async {
     supportDir = await Directory.systemTemp.createTemp('ipgeo-test-');
+    supportPath = supportDir.path;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
       const MethodChannel('plugins.flutter.io/path_provider'),
       (MethodCall call) async {
         if (call.method == 'getApplicationSupportDirectory') {
-          return supportDir.path;
+          return supportPath;
         }
         return null;
       },
+    );
+    // 合成数据种进应用的数据目录 <support>/geo/（下载成功后的样子）。
+    await seedGeoDataDir(
+      Directory('$supportPath/geo'),
+      SyntheticGeoDataset(),
     );
   });
 
@@ -52,5 +65,16 @@ void main() {
   test('hostname is not resolved by the database itself', () async {
     final db = await IpGeoDatabase.open();
     expect(await db.lookup('localhost'), isNull);
+  });
+
+  test('empty data dir returns null without throwing', () async {
+    final empty = await Directory.systemTemp.createTemp('ipgeo-empty-');
+    supportPath = empty.path;
+    final db = await IpGeoDatabase.refresh();
+    expect(db.hasData, isFalse);
+    expect(await db.lookup('8.8.8.8'), isNull);
+    // 恢复成有数据的目录，免得影响后面的测试。
+    supportPath = supportDir.path;
+    await IpGeoDatabase.refresh();
   });
 }

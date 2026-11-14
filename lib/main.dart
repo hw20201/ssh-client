@@ -1276,6 +1276,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       if (values.isNotEmpty) _selected = values.first;
     });
     if (values.isNotEmpty) unawaited(_loadGeoLocations(values));
+    // v21：地理数据不再打进包里，启动后在后台检查一次远程更新
+    // （首次启动下载、以后每天最多查一次；失败/离线不影响首页，
+    // 有新数据时重新解析一次已保存服务器的位置）。
+    unawaited(_refreshGeoDataInBackground());
     // 地球已在树上，开始首开预热倒数（见 _buildShaderWarmup）。
     _startWarmupCountdown();
   }
@@ -1331,6 +1335,20 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           ..clear()
           ..addAll(resolved);
       });
+    }
+  }
+
+  /// v21：后台检查并更新地理数据。测试环境（FLUTTER_TEST）下不跑：
+  /// 真实 HTTP/文件 I/O 在 testWidgets 的假时间里会挂起，下载完成
+  /// 还可能中途改写地理结果，干扰 morph 测试的“德国”兜底断言。
+  Future<void> _refreshGeoDataInBackground() async {
+    if (Platform.environment['FLUTTER_TEST'] == 'true') return;
+    try {
+      final result = await GeoDataUpdater().ensureAndUpdate();
+      if (!mounted || !result.updated) return;
+      if (_profiles.isNotEmpty) unawaited(_loadGeoLocations(_profiles));
+    } catch (_) {
+      // 后台更新永不打扰首页；失败时本地数据（或兜底）照常工作。
     }
   }
 
