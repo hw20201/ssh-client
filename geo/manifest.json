@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "generated": "2026-11",
+  "attribution": "IP geolocation by DB-IP (https://db-ip.com), CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)",
+  "assets": [
+    {
+      "name": "ip4_city_v1.bin.gz",
+      "family": 4,
+      "records": 3550398,
+      "bytes": 14276710,
+      "unpackedBytes": 24853830,
+      "sha256": "2f46a71a54dc083e199aeb9bfb9179d7c89357a8c0a32a51e216c8fa9d47170e"
+    },
+    {
+      "name": "ip6_city_v1.bin.gz",
+      "family": 6,
+      "records": 3819012,
+      "bytes": 12233467,
+      "unpackedBytes": 30814260,
+      "sha256": "c623a82316ac23bc1f701497747b48703d2ab4dd2e62ce54c8a15b582508afce"
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+name: ssh_client
+description: A personal Flutter SSH terminal for Android.
+publish_to: none
+version: 0.1.0+1
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  prism_ui:
+    git:
+      url: https://github.com/chen08209/prism_ui.git
+      ref: 5d8ed7ab674ed2011adf94a7e41aff6d705e9cb6
+  dartssh2: ^4.1.0
+  xterm2: ^5.3.0
+  fluid_glass: ^0.5.6
+  shared_preferences: ^2.5.6
+  flutter_secure_storage: ^11.2.0
+  file_picker: ^13.3.3
+  crypto: ^3.0.6
+  path_provider: ^2.1.5
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  # v9：测试里 FakePlatformFile 的 xFile 要用到 XFile（file_picker 的传递依赖，
+  # 只在测试里直接引用，所以声明为 dev 依赖）。
+  cross_file: ^0.3.5+5
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/geo/land_110m.bin
+    - assets/geo/ip4_city_v1.bin.gz
+    - assets/geo/ip6_city_v1.bin.gz
+    - assets/geo/manifest.json
