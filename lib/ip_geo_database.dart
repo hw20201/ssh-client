@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -190,6 +191,7 @@ class GeoUpdateResult {
     required this.updated,
     required this.hasData,
     this.error,
+    this.cancelled = false,
   });
 
   /// Local data changed (downloaded or replaced).
@@ -200,7 +202,64 @@ class GeoUpdateResult {
 
   /// Last error, if any. Never thrown to the caller.
   final String? error;
+
+  /// The user cancelled the download; staged files were discarded and
+  /// local data is untouched.
+  final bool cancelled;
 }
+
+/// One phase of a first-time geo-data download (both bundles combined).
+enum GeoDownloadPhase {
+  /// Fetching the remote manifest; total size not known yet.
+  preparing,
+
+  /// Streaming the bundles; [GeoDownloadProgress.fraction] advances.
+  downloading,
+
+  /// All bytes received; verifying checksums before the atomic replace.
+  verifying,
+
+  /// Download + verify done; new data installed.
+  done,
+}
+
+/// Combined download progress for the first-time geo-data download.
+/// Reported to the first-launch dialog; the two bundles count as one
+/// total (manifest asset bytes summed), not one bar each.
+class GeoDownloadProgress {
+  const GeoDownloadProgress({
+    required this.phase,
+    this.downloadedBytes = 0,
+    this.totalBytes = 0,
+  });
+
+  final GeoDownloadPhase phase;
+
+  /// Bytes received so far, across all bundles.
+  final int downloadedBytes;
+
+  /// Total bytes to receive (manifest asset bytes summed); 0 while
+  /// the manifest has not been fetched yet.
+  final int totalBytes;
+
+  double get fraction => totalBytes > 0
+      ? (downloadedBytes / totalBytes).clamp(0.0, 1.0)
+      : 0.0;
+}
+
+/// One first-download attempt: runs the download, reports combined
+/// progress, polls [isCancelled] between chunks (and every 200ms while
+/// a stream is stalled, so Cancel stays responsive). Returns the result;
+/// the dialog decides from it whether to auto-close or offer Retry.
+typedef GeoFirstDownloadRunner = Future<GeoUpdateResult> Function({
+  required void Function(GeoDownloadProgress) onProgress,
+  required bool Function() isCancelled,
+});
+
+/// Thrown inside the download loop when the user cancels. Caught by
+/// [GeoDataUpdater.ensureAndUpdate] and turned into a cancelled result
+/// (staged .tmp files deleted, local data untouched).
+class _GeoDownloadCancelled implements Exception {}
 
 /// Downloads and updates the IP geolocation dataset from GitHub Releases.
 ///
@@ -226,9 +285,16 @@ class GeoDataUpdater {
 
   /// Makes sure usable local geo data exists and is up to date.
   /// Never throws; failures are reported in the result.
-  Future<GeoUpdateResult> ensureAndUpdate({bool force = false}) async {
+  Future<GeoUpdateResult> ensureAndUpdate({
+    bool force = false,
+    void Function(GeoDownloadProgress)? onProgress,
+    bool Function()? isCancelled,
+  }) async {
     try {
       final dir = await geoDataDir();
+      onProgress?.call(
+        const GeoDownloadProgress(phase: GeoDownloadPhase.preparing),
+      );
       final localManifest = File('${dir.path}/manifest.json');
       // Seed: copy the bundled manifest in as the initial local manifest,
       // so the app knows the dataset version before the first download.
@@ -299,29 +365,116 @@ class GeoDataUpdater {
         return const GeoUpdateResult(updated: false, hasData: true);
       }
       // Download every asset, verify, then replace atomically.
+      // v22: stream to the .tmp files chunk by chunk (the whole 26.5MB
+      // never sits in memory) so the first-launch dialog can show live
+      // progress; cancel is polled per chunk and every 200ms while a
+      // stream stalls, so tapping 取消 always stops the download.
+      final totalBytes = entries.fold<int>(
+        0,
+        (sum, e) => sum + (e['bytes'] as int),
+      );
+      var downloadedSoFar = 0;
+      onProgress?.call(
+        GeoDownloadProgress(
+          phase: GeoDownloadPhase.downloading,
+          totalBytes: totalBytes,
+        ),
+      );
       final staged = <File>[];
       try {
         for (final entry in entries) {
+          if (isCancelled?.call() ?? false) {
+            throw _GeoDownloadCancelled();
+          }
           final name = entry['name'] as String;
-          final res = await _client
-              .get(Uri.parse('$baseUrl$name'))
+          final expectedBytes = entry['bytes'] as int;
+          final tmp = File('${dir.path}/$name.tmp');
+          if (await tmp.exists()) await tmp.delete();
+          staged.add(tmp);
+          final request = http.Request('GET', Uri.parse('$baseUrl$name'));
+          final streamed = await _client
+              .send(request)
               .timeout(const Duration(seconds: 60));
-          if (res.statusCode != 200) {
+          if (streamed.statusCode != 200) {
             throw HttpException(
-              'Download $name failed: HTTP ${res.statusCode}',
+              'Download $name failed: HTTP ${streamed.statusCode}',
             );
           }
-          final bytes = res.bodyBytes;
-          if (bytes.length != entry['bytes'] ||
-              sha256.convert(bytes).toString() != entry['sha256']) {
+          final sink = tmp.openWrite();
+          var fileBytes = 0;
+          var aborted = false;
+          final done = Completer<void>();
+          late final StreamSubscription<List<int>> subscription;
+          Timer? cancelTimer;
+          subscription = streamed.stream.listen(
+            (chunk) {
+              if (isCancelled?.call() ?? false) {
+                aborted = true;
+                unawaited(subscription.cancel());
+                if (!done.isCompleted) done.complete();
+                return;
+              }
+              sink.add(chunk);
+              fileBytes += chunk.length;
+              downloadedSoFar += chunk.length;
+              onProgress?.call(
+                GeoDownloadProgress(
+                  phase: GeoDownloadPhase.downloading,
+                  downloadedBytes: downloadedSoFar,
+                  totalBytes: totalBytes,
+                ),
+              );
+            },
+            onError: (Object error) {
+              if (!done.isCompleted) done.completeError(error);
+            },
+            onDone: () {
+              if (!done.isCompleted) done.complete();
+            },
+            cancelOnError: true,
+          );
+          if (isCancelled != null) {
+            cancelTimer = Timer.periodic(
+              const Duration(milliseconds: 200),
+              (_) {
+                if (isCancelled()) {
+                  aborted = true;
+                  cancelTimer?.cancel();
+                  unawaited(subscription.cancel());
+                  if (!done.isCompleted) done.complete();
+                }
+              },
+            );
+          }
+          try {
+            await done.future;
+          } finally {
+            cancelTimer?.cancel();
+            await sink.close();
+          }
+          if (aborted || (isCancelled?.call() ?? false)) {
+            throw _GeoDownloadCancelled();
+          }
+          if (fileBytes != expectedBytes) {
+            throw FormatException(
+              'Downloaded $name has an unexpected size '
+              '($fileBytes bytes, expected $expectedBytes).',
+            );
+          }
+          final bytes = await tmp.readAsBytes();
+          if (sha256.convert(bytes).toString() != entry['sha256']) {
             throw FormatException(
               'Downloaded $name failed its SHA256 check.',
             );
           }
-          final tmp = File('${dir.path}/$name.tmp');
-          await tmp.writeAsBytes(bytes, flush: true);
-          staged.add(tmp);
         }
+        onProgress?.call(
+          GeoDownloadProgress(
+            phase: GeoDownloadPhase.verifying,
+            downloadedBytes: downloadedSoFar,
+            totalBytes: totalBytes,
+          ),
+        );
         for (final entry in entries) {
           final name = entry['name'] as String;
           final tmp = File('${dir.path}/$name.tmp');
@@ -334,7 +487,24 @@ class GeoDataUpdater {
         await _recordCheck(dir);
         await IpGeoDatabase.refresh();
         final db = await IpGeoDatabase.open();
+        onProgress?.call(
+          GeoDownloadProgress(
+            phase: GeoDownloadPhase.done,
+            downloadedBytes: downloadedSoFar,
+            totalBytes: totalBytes,
+          ),
+        );
         return GeoUpdateResult(updated: true, hasData: db.hasData);
+      } on _GeoDownloadCancelled {
+        for (final tmp in staged) {
+          if (await tmp.exists()) await tmp.delete();
+        }
+        final db = await IpGeoDatabase.open();
+        return GeoUpdateResult(
+          updated: false,
+          hasData: db.hasData,
+          cancelled: true,
+        );
       } catch (e) {
         for (final tmp in staged) {
           if (await tmp.exists()) await tmp.delete();

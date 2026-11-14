@@ -26,7 +26,12 @@ void main() async {
 }
 
 class SshApp extends StatefulWidget {
-  const SshApp({super.key, this.sessionConnector, this.onGlobeCameraChanged});
+  const SshApp({
+    super.key,
+    this.sessionConnector,
+    this.onGlobeCameraChanged,
+    this.geoFirstDownloadRunner,
+  });
 
   /// v13：建会话的出口（测试注入假的；生产默认真 dartssh2）。
   final SessionConnector? sessionConnector;
@@ -35,6 +40,11 @@ class SshApp extends StatefulWidget {
   /// 恢复斜坡用——相机经度是转速的直接信号，比卡片屏上位置准
   /// （卡片位置还受投影影响）。
   final ValueChanged<GlobeCamera>? onGlobeCameraChanged;
+
+  /// v22：首次启动地理数据下载弹窗的测试出口（生产不传）：
+  /// 传入后，_load 里本地无数据时弹下载弹窗而不是静默更新，
+  /// 且下载走这里给的 runner（测试用假的流式下载）。
+  final GeoFirstDownloadRunner? geoFirstDownloadRunner;
   @override
   State<SshApp> createState() => _SshAppState();
 }
@@ -89,6 +99,7 @@ class _SshAppState extends State<SshApp> {
         home: HomePage(
           sessionConnector: widget.sessionConnector,
           onGlobeCameraChanged: widget.onGlobeCameraChanged,
+          geoFirstDownloadRunner: widget.geoFirstDownloadRunner,
         ),
       ),
     );
@@ -224,6 +235,7 @@ class HomePage extends StatefulWidget {
     super.key,
     this.sessionConnector,
     this.onGlobeCameraChanged,
+    this.geoFirstDownloadRunner,
   });
 
   /// v13：建会话的出口（测试注入假的；生产默认真 dartssh2）。
@@ -231,6 +243,9 @@ class HomePage extends StatefulWidget {
 
   /// v18：地球仪相机回调的测试出口（见 SshApp.onGlobeCameraChanged）。
   final ValueChanged<GlobeCamera>? onGlobeCameraChanged;
+
+  /// v22：首次启动地理数据下载弹窗的测试出口（见 SshApp）。
+  final GeoFirstDownloadRunner? geoFirstDownloadRunner;
   @override
   State<HomePage> createState() => _HomePageState();
 }
@@ -1276,10 +1291,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       if (values.isNotEmpty) _selected = values.first;
     });
     if (values.isNotEmpty) unawaited(_loadGeoLocations(values));
-    // v21：地理数据不再打进包里，启动后在后台检查一次远程更新
-    // （首次启动下载、以后每天最多查一次；失败/离线不影响首页，
-    // 有新数据时重新解析一次已保存服务器的位置）。
-    unawaited(_refreshGeoDataInBackground());
+    // v22：地理数据首次启动不再静默下载——本地没有数据时弹下载弹窗
+    // （带进度条、失败可重试）；已有旧数据时才走 v21 的静默后台更新。
+    unawaited(_maybeShowGeoFirstDownload());
     // 地球已在树上，开始首开预热倒数（见 _buildShaderWarmup）。
     _startWarmupCountdown();
   }
@@ -1350,6 +1364,59 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     } catch (_) {
       // 后台更新永不打扰首页；失败时本地数据（或兜底）照常工作。
     }
+  }
+
+  /// v22：首次启动下载弹窗是否已弹过（每个应用进程只弹一次；
+  /// 取消后下次启动（新进程）没数据还会再弹）。
+  bool _geoDialogShown = false;
+
+  /// v22：本地没有地理数据时弹下载弹窗（带进度条、失败可重试），
+  /// 而不是 v21 的静默后台下载——主人 16:36：“不然的话，那就挺
+  /// 莫名其妙的”。已有旧数据时不弹，走 v21 的静默后台更新。
+  /// 测试环境默认不弹（真实 I/O 在 testWidgets 假时间里会挂起）；
+  /// 传入 geoFirstDownloadRunner 的测试显式打开这条路。
+  Future<void> _maybeShowGeoFirstDownload() async {
+    final runner = widget.geoFirstDownloadRunner;
+    if (runner == null && Platform.environment['FLUTTER_TEST'] == 'true') {
+      return;
+    }
+    if (_geoDialogShown) return;
+    final db = await IpGeoDatabase.open();
+    if (!mounted) return;
+    if (db.hasData) {
+      unawaited(_refreshGeoDataInBackground());
+      return;
+    }
+    _geoDialogShown = true;
+    // 首页先出来再弹（_load 在 initState 里调，showDialog 要等第一帧）。
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      final done = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => PopScope(
+          canPop: false,
+          child: _GeoFirstDownloadDialog(
+            runner: runner ?? _defaultGeoFirstDownloadRunner,
+          ),
+        ),
+      );
+      if (done == true && mounted && _profiles.isNotEmpty) {
+        unawaited(_loadGeoLocations(_profiles));
+      }
+    });
+  }
+
+  /// v22：生产用的下载 runner（测试用 geoFirstDownloadRunner 注入假的）。
+  Future<GeoUpdateResult> _defaultGeoFirstDownloadRunner({
+    required void Function(GeoDownloadProgress) onProgress,
+    required bool Function() isCancelled,
+  }) {
+    return GeoDataUpdater().ensureAndUpdate(
+      force: true,
+      onProgress: onProgress,
+      isCancelled: isCancelled,
+    );
   }
 
   /// v11：写盘 + 刷新列表和地理位置（保存和删除共用）。
@@ -2861,9 +2928,184 @@ class _CapsuleStagger extends StatelessWidget {
 /// 淡色 + 一圈微高光（GlassStyles.field 的 rim .3）。
 /// 用 ConstrainedBox(minHeight: 48) 而不是定死 48：校验报错行出现时
 /// 字段要能长高（不然报错行直接溢出）；平时 48，报错时照样圆。
+/// v22：首次启动地理数据下载弹窗（主人 2026-11-14 16:36：静默后台下载
+/// “挺莫名其妙的”，要一个看得见的弹窗 + 进度条 + 失败重试）。
+///
+/// 只在本地完全没有地理数据时弹（模态：点外面关不掉、返回键也关不掉，
+/// 要么等下完、要么点“取消”）；已有旧数据时不弹，走 v21 的静默后台更新。
+/// 两个城市库合起来算一个总进度（manifest 里各文件字节数相加），
+/// 不给每个文件各一个进度条。
+/// 下完、SHA-256 校验通过、数据替换成功后自动关掉，地球仪随即解析位置；
+/// 失败时显示一句原因 + “重试”按钮，点“重试”从头再下一次（不断点续传）；
+/// 点“取消”停止下载、关弹窗，下次启动没数据再弹一次。
+/// 样式复用 _GlassAlert（GlassStyles.panel 的玻璃 + 胶囊按钮那套）。
+class _GeoFirstDownloadDialog extends StatefulWidget {
+  const _GeoFirstDownloadDialog({required this.runner});
+
+  /// 启动一次下载尝试：开弹窗时调一次，点“重试”时再调一次。
+  /// [onProgress] 收合并进度；[isCancelled] 由下载方在块之间轮询。
+  final GeoFirstDownloadRunner runner;
+
+  @override
+  State<_GeoFirstDownloadDialog> createState() =>
+      _GeoFirstDownloadDialogState();
+}
+
+class _GeoFirstDownloadDialogState extends State<_GeoFirstDownloadDialog> {
+  GeoDownloadProgress _progress = const GeoDownloadProgress(
+    phase: GeoDownloadPhase.preparing,
+  );
+  String? _failure;
+  bool _cancelled = false;
+  int _attempt = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _startAttempt();
+  }
+
+  Future<void> _startAttempt() async {
+    final attempt = ++_attempt;
+    _cancelled = false;
+    setState(() {
+      _failure = null;
+      _progress = const GeoDownloadProgress(
+        phase: GeoDownloadPhase.preparing,
+      );
+    });
+    final result = await widget.runner(
+      onProgress: (p) {
+        if (mounted && attempt == _attempt) {
+          setState(() => _progress = p);
+        }
+      },
+      isCancelled: () => _cancelled || attempt != _attempt,
+    );
+    if (!mounted || attempt != _attempt) return;
+    if (result.cancelled) {
+      // 用户点的取消：直接关弹窗（下次启动没数据再弹）。
+      Navigator.of(context).pop(false);
+      return;
+    }
+    if (result.hasData && result.error == null) {
+      // 下完且可用（不论是新下的还是本来就有的）：自动关掉。
+      Navigator.of(context).pop(true);
+      return;
+    }
+    // 失败：留弹窗，显示一句原因 + “重试”。
+    setState(() => _failure = _friendlyGeoDownloadError(result.error));
+  }
+
+  void _cancel() {
+    _cancelled = true;
+    // 弹窗立刻关掉（取消要灵敏）；下载方在下一个轮询点看到取消信号后
+    // 停掉、清掉临时文件，晚到的结果不再有人消费。
+    Navigator.of(context).pop(false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final failed = _failure != null;
+    final totalKnown = _progress.totalBytes > 0;
+    final description = failed
+        ? _failure!
+        : totalKnown
+        ? '首次启动需要下载约 ${_formatGeoBytes(_progress.totalBytes)} 的 IP 位置数据，用于在地球仪上显示服务器所在位置。'
+        : '正在连接服务器，准备下载 IP 位置数据……';
+    final status = failed
+        ? '下载失败，请重试。'
+        : _progress.phase == GeoDownloadPhase.verifying ||
+              (_progress.phase == GeoDownloadPhase.downloading &&
+                  _progress.fraction >= 1)
+        ? '正在校验数据…'
+        : _progress.phase == GeoDownloadPhase.downloading
+        ? '已下载 ${_formatGeoBytes(_progress.downloadedBytes)} / 共 ${_formatGeoBytes(_progress.totalBytes)}（${(_progress.fraction * 100).round()}%）'
+        : _progress.phase == GeoDownloadPhase.done
+        ? '下载完成'
+        : '正在准备下载…';
+    return _GlassAlert(
+      key: const ValueKey('geo_download_dialog'),
+      title: '首次启动 · 下载位置数据',
+      caption: '下载后，服务器会在地球仪上显示真实位置',
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            description,
+            style: failed
+                ? GlassText.bodyStyle.copyWith(
+                    color: const Color(0xffff9d8a),
+                  )
+                : GlassText.bodyStyle,
+          ),
+          const SizedBox(height: 14),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(3),
+            child: LinearProgressIndicator(
+              key: const ValueKey('geo_download_bar'),
+              value: failed
+                  ? 0
+                  : totalKnown
+                  ? _progress.fraction
+                  : null,
+              minHeight: 6,
+              backgroundColor: Colors.white.withValues(alpha: .12),
+              valueColor: const AlwaysStoppedAnimation<Color>(
+                GlassText.accent,
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            status,
+            key: const ValueKey('geo_download_progress_text'),
+            style: GlassText.captionStyle,
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          key: const ValueKey('geo_download_cancel'),
+          onPressed: _cancel,
+          child: const Text('取消'),
+        ),
+        if (failed)
+          FilledButton(
+            key: const ValueKey('geo_download_retry'),
+            onPressed: _startAttempt,
+            child: const Text('重试'),
+          ),
+      ],
+    );
+  }
+}
+
+/// v22：下载量格式化（十进制 MB，和主人说的“约 26.5MB”一致；
+/// 小文件按 KB/B 显示，测试用的合成数据集走这支）。
+String _formatGeoBytes(int bytes) {
+  if (bytes >= 1000000) {
+    return '${(bytes / 1000000).toStringAsFixed(1)}MB';
+  }
+  if (bytes >= 1000) return '${(bytes / 1000).toStringAsFixed(0)}KB';
+  return '$bytes B';
+}
+
+/// v22：下载失败的技术原因翻成一句人话（只给弹窗显示用，日志里仍是原值）。
+String _friendlyGeoDownloadError(String? error) {
+  final raw = error ?? '';
+  if (raw.contains('SHA256') || raw.contains('SHA-256')) {
+    return '下载的数据校验失败，请重试。';
+  }
+  if (raw.contains('HTTP')) return '下载失败（服务器返回错误），请检查网络后重试。';
+  return '下载失败，请检查网络后重试。';
+}
+
 /// 玻璃弹窗：复用 _FormGlassPanel 的视觉语言（标题栏 + 青色竖条）。
 class _GlassAlert extends StatelessWidget {
   const _GlassAlert({
+    super.key,
     required this.title,
     required this.caption,
     required this.content,
